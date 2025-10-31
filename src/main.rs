@@ -105,7 +105,6 @@ impl Display for TodoItem {
 
 struct TodoList {
     buffer: Vec<TodoItem>,
-    path: String,
     file: RefCell<fs::File>,
 }
 
@@ -202,7 +201,6 @@ impl TodoList {
 
         Ok(TodoList {
             buffer,
-            path: value.to_string(),
             file: RefCell::new(file),
         })
     }
@@ -228,7 +226,6 @@ impl Default for TodoList {
 
         TodoList {
             buffer: Vec::new(),
-            path: get_default_path(),
             file: RefCell::new(file),
         }
     }
