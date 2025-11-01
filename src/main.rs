@@ -1,16 +1,18 @@
 use clap::Parser;
 use dirs::data_dir;
+use property::Property;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::OpenOptions;
-use std::hash::Hash;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::prelude::*;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::{fs, io};
 use ter_menu::TerminalDropDown;
 
@@ -23,6 +25,12 @@ fn get_default_path() -> String {
         .to_string()
 }
 
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s); // 将值的哈希写入哈希器
+    s.finish() // 获取最终哈希值（u64）
+}
+
 fn fix(path: String) -> String {
     let path = Path::new(&path);
     if path.is_dir() || !path.extension().map_or(false, |ext| ext == "todo") {
@@ -32,9 +40,20 @@ fn fix(path: String) -> String {
         } else {
             new_path.set_extension("todo");
         }
-        new_path.to_str().unwrap().to_string()
+        new_path
+            .to_str()
+            .unwrap_or_else(|| {
+                eprintln!("The path is not allowed.");
+                exit(1);
+            })
+            .to_string()
     } else {
-        path.to_str().unwrap().to_string()
+        path.to_str()
+            .unwrap_or_else(|| {
+                eprintln!("The path is not allowed.");
+                exit(1);
+            })
+            .to_string()
     }
 }
 
@@ -89,7 +108,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq, Hash, Property)]
 struct TodoItem {
     name: String,
     content: String,
@@ -112,8 +131,12 @@ struct TodoList {
 }
 
 impl TodoList {
-    fn add_item(&mut self, item: TodoItem) {
+    fn add_item(&mut self, item: TodoItem) -> bool {
+        if self.buffer.iter().any(|i| calculate_hash(&i) == calculate_hash(&item)) {
+            return false;
+        }
         self.buffer.push(item);
+        true
     }
 
     fn analysis(&self) -> &Vec<TodoItem> {
@@ -139,17 +162,8 @@ impl TodoList {
     }
 
     fn del_by_name(&mut self, name: String) {
-        let mut index = usize::MAX;
-        let todo_item = self.get_item_by_name(name.as_str()).unwrap();
-        for (i, item) in self.buffer.iter().enumerate() {
-            if item == todo_item {
-                index = i;
-                break;
-            }
-        }
-
-        if index != usize::MAX {
-            self.buffer.remove(index);
+        if let Some(index) = self.buffer.iter().position(|item| item.name == name) {
+            self.buffer.swap_remove(index);
         }
     }
 
@@ -169,11 +183,6 @@ impl TodoList {
             // 匹配规则：名称（小写）包含关键词（小写），覆盖更多场景
             .filter(|item| item.name.to_lowercase().contains(&keyword_lower))
             .collect()
-    }
-
-    // 保留原方法（如需单个结果可调用此方法，基于新的匹配规则）
-    fn get_item_by_name(&self, keyword: &str) -> Option<&TodoItem> {
-        self.find_items_by_name(keyword).into_iter().next()
     }
 
     fn open(value: &str) -> Result<Self, Box<dyn Error>> {
@@ -241,6 +250,40 @@ impl Drop for TodoList {
     }
 }
 
+struct JoinHandlerScope<T> {
+    handles: Arc<Mutex<Vec<JoinHandle<T>>>>,
+}
+
+impl<T> JoinHandlerScope<T> {
+    fn new() -> Self {
+        Self {
+            handles: Arc::new(Mutex::new(vec![])),
+        }
+    }
+
+    fn add(&self, handle: JoinHandle<T>) {
+        self.handles.lock().unwrap().push(handle);
+    }
+
+    fn join(&mut self) {
+        // 循环处理所有线程，包括等待过程中新增的线程
+        while !self.handles.lock().unwrap().is_empty() {
+            // 取出当前所有线程句柄
+            let handles = self.handles.lock().unwrap().drain(..).collect::<Vec<_>>();
+            // 逐个等待线程完成
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+
+impl<T> Drop for JoinHandlerScope<T> {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
 fn main() {
     let args = Command::parse();
     match args {
@@ -256,15 +299,85 @@ fn main() {
                 priority,
             };
             let mut todo_list = open_todo_list(path);
-            todo_list.add_item(todo_item);
+            if !todo_list.add_item(todo_item) {
+                println!("There is another todo that is equal to this todo");
+                exit(0);
+            }
         }
         Command::View { path } => {
-            let todo_list = open_todo_list(path);
-            let mut buffer = todo_list.analysis().clone();
-            buffer.sort_by(|a, b| b.priority.cmp(&a.priority));
-            buffer.iter().for_each(|item| {
-                println!("--------------------\n{}\n--------------------", item);
+            let todo_list = Arc::new(Mutex::new(open_todo_list(path)));
+            let todos = {
+                let list_clone = Arc::clone(&todo_list);
+                let mut todos = list_clone
+                    .lock()
+                    .unwrap()
+                    .analysis()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<TodoItem>>();
+                todos.sort_by(|a, b| b.priority.cmp(&a.priority));
+                todos
+            };
+            if todos.is_empty() {
+                println!("No item in history.");
+                return;
+            }
+
+            // 下拉菜单仅负责选择TodoItem，不处理后续操作
+            let mut selection_map = HashMap::new();
+            for todo in &todos {
+                // 存储待选的TodoItem（克隆一份，避免生命周期问题）
+                selection_map.insert(todo.clone(), Box::new(|_: &TodoItem| {}));
+            }
+
+            let dropdown = TerminalDropDown::use_drop_down(selection_map, todos.len() + 1);
+            // 等待用户选择一个TodoItem，此时下拉菜单占用输入流
+            let selected_todo = match dropdown.wait() {
+                Ok(Some(selected)) => selected, // 获取用户选择的TodoItem
+                Ok(None) => {
+                    println!("Canceled selection.");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Error during selection: {:?}", e);
+                    return;
+                }
+            };
+
+            // 下拉菜单已退出，输入流释放，此时处理用户操作选择
+            println!("What do you want?(1:Monopoly 2:Delete other: Cancel");
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let selection = input.trim().parse::<usize>().unwrap_or_else(|_| {
+                println!("Canceled.");
+                exit(0);
             });
+
+            match selection {
+                1 => {
+                    // 查看操作：直接打印
+                    println!("--------------------\n{}\n--------------------", todos[selected_todo]);
+                }
+                2 => {
+                    // 删除操作：确认后执行
+                    println!("Are you sure?(y/N)");
+                    io::stdout().flush().unwrap();
+                    let mut confirm = String::new();
+                    io::stdin().read_line(&mut confirm).unwrap();
+                    if confirm.trim().to_lowercase() != "y" {
+                        println!("Canceled.");
+                        return;
+                    }
+                    // 执行删除
+                    let mut todo_list = todo_list.lock().unwrap();
+                    todo_list.del_by_name(todos[selected_todo].name().to_owned());
+                    println!("Done");
+                }
+                _ => {
+                    println!("Canceled.");
+                }
+            }
         }
         Command::Find { path, name } => {
             let todo_list = open_todo_list(path);
@@ -294,8 +407,7 @@ fn main() {
                 let list_guard = todo_list.lock().unwrap(); // 临时锁
                 list_guard
                     .find_items_by_name(&name[..])
-                    .iter()
-                    .copied()
+                    .into_iter()
                     .cloned() // 克隆 TodoItem，脱离锁的生命周期
                     .collect()
             }; // 此处 list_guard 自动释放锁，避免生命周期问题
