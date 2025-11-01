@@ -1,15 +1,18 @@
 use clap::Parser;
 use dirs::data_dir;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::OpenOptions;
+use std::hash::Hash;
 use std::io::prelude::*;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::exit;
+use std::sync::{Arc, Mutex};
 use std::{fs, io};
+use ter_menu::TerminalDropDown;
 
 fn get_default_path() -> String {
     data_dir()
@@ -86,7 +89,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq, Hash)]
 struct TodoItem {
     name: String,
     content: String,
@@ -105,7 +108,7 @@ impl Display for TodoItem {
 
 struct TodoList {
     buffer: Vec<TodoItem>,
-    file: RefCell<fs::File>,
+    file: Mutex<fs::File>,
 }
 
 impl TodoList {
@@ -118,7 +121,7 @@ impl TodoList {
     }
 
     fn clear(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut file = self.file.borrow_mut();
+        let mut file = self.file.lock().unwrap();
 
         // 步骤1：先刷新缓冲区，避免数据残留
         file.flush()?;
@@ -139,8 +142,7 @@ impl TodoList {
         let mut index = usize::MAX;
         let todo_item = self.get_item_by_name(name.as_str()).unwrap();
         for (i, item) in self.buffer.iter().enumerate() {
-            if item == todo_item
-            {
+            if item == todo_item {
                 index = i;
                 break;
             }
@@ -153,7 +155,7 @@ impl TodoList {
 
     fn save_to_file(&self) -> Result<(), Box<dyn Error>> {
         let serialized = serde_json::to_string(&self.buffer)?;
-        let mut file = self.file.borrow_mut();
+        let mut file = self.file.lock().unwrap();
         file.set_len(0)?; // 用 ? 替代 unwrap()
         file.rewind()?;
         file.write_all(serialized.as_bytes())?;
@@ -201,7 +203,7 @@ impl TodoList {
 
         Ok(TodoList {
             buffer,
-            file: RefCell::new(file),
+            file: Mutex::new(file),
         })
     }
 
@@ -226,7 +228,7 @@ impl Default for TodoList {
 
         TodoList {
             buffer: Vec::new(),
-            file: RefCell::new(file),
+            file: Mutex::new(file),
         }
     }
 }
@@ -285,17 +287,47 @@ fn main() {
             println!("Done.");
         }
         Command::Delete { path, name } => {
-            let mut todo_list = open_todo_list(path);
+            // 关键：TodoList 全程用 Arc<Mutex<>> 包装，确保 'static 生命周期
+            let todo_list = Arc::new(Mutex::new(open_todo_list(path)));
+            // 临时解锁读取匹配项，避免锁与 todo_list 生命周期绑定（解决 `list` 生命周期错误）
+            let todos: Vec<TodoItem> = {
+                let list_guard = todo_list.lock().unwrap(); // 临时锁
+                list_guard
+                    .find_items_by_name(&name[..])
+                    .iter()
+                    .copied()
+                    .cloned() // 克隆 TodoItem，脱离锁的生命周期
+                    .collect()
+            }; // 此处 list_guard 自动释放锁，避免生命周期问题
+
+            if todos.is_empty() {
+                println!("No item with that name found.");
+                return;
+            }
+
+            // 为每个待选项创建独立闭包（每个闭包克隆 Arc，满足 'static）
+            let mut drop_down_items = HashMap::new();
+            for todo in todos {
+                let list_clone = todo_list.clone(); // 克隆 Arc，每个闭包独立持有
+                drop_down_items.insert(todo.clone(), move |_selected: &TodoItem| {
+                    // 解锁执行删除（Arc 克隆确保生命周期足够）
+                    let mut list_guard = list_clone.lock().unwrap();
+                    list_guard.del_by_name(todo.name.clone());
+                    println!("\nSuccessfully deleted item: {}", todo.name);
+                });
+            }
+
+            // 启动下拉菜单并等待线程结束（确保生命周期匹配）
             println!(
-                "--------------------\n{}\n--------------------",
-                todo_list.get_item_by_name(&name[..]).unwrap_or_else(|| {
-                    println!("Can not find {}", name);
-                    exit(1);
-                })
+                "Found {} matching items. Use Up/Down to select, Enter to delete, Esc to cancel.",
+                drop_down_items.len()
             );
-            exit_when_refuse();
-            todo_list.del_by_name(name);
-            println!("Done.");
+            let dropdown = TerminalDropDown::use_drop_down(drop_down_items, 1);
+            if let Err(e) = dropdown.wait() {
+                eprintln!("Error during selection: {:?}", e);
+            }
+
+            println!("\nDelete command finished.");
         }
     }
 }
